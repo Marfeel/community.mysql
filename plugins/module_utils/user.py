@@ -323,6 +323,10 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
                 update = True
 
             if update:
+                password_changed = True
+                msg = "Password updated"
+                if module.check_mode:
+                        return {'changed': True, 'msg': msg, 'password_changed': password_changed}
                 if plugin_hash_string:
                     query_with_args = "ALTER USER %s@%s IDENTIFIED WITH %s AS %s", (user, host, plugin, plugin_hash_string)
                 elif plugin_auth_string:
@@ -335,7 +339,6 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
                     query_with_args = "ALTER USER %s@%s IDENTIFIED WITH %s", (user, host, plugin)
 
                 cursor.execute(*query_with_args)
-                password_changed = True
                 changed = True
 
         # Handle privileges
