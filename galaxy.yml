@@ -1,11 +1,11 @@
 ---
 namespace: community
 name: mysql
-version: 3.8.0
+version: 3.10.0
 readme: README.md
 authors:
   - Ansible community
-description: MySQL collection for Ansible
+description: MySQL and MariaDB collection for Ansible
 license_file: COPYING
 tags:
   - database

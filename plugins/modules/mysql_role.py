@@ -11,10 +11,10 @@ DOCUMENTATION = r'''
 ---
 module: mysql_role
 
-short_description: Adds, removes, or updates a MySQL role
+short_description: Adds, removes, or updates a MySQL or MariaDB role
 
 description:
-   - Adds, removes, or updates a MySQL role.
+   - Adds, removes, or updates a MySQL or MariaDB role.
    - Roles are supported since MySQL 8.0.0 and MariaDB 10.0.5.
 
 version_added: '2.2.0'
@@ -132,6 +132,7 @@ options:
     version_added: '3.8.0'
 
 notes:
+  - Roles are supported since MySQL 8.0.0 and MariaDB 10.0.5.
   - Pay attention that the module runs C(SET DEFAULT ROLE ALL TO)
     all the I(members) passed by default when the state has changed.
     If you want to avoid this behavior, set I(set_default_role_all) to C(no).
@@ -309,7 +310,7 @@ from ansible_collections.community.mysql.plugins.module_utils.mysql import (
 )
 from ansible_collections.community.mysql.plugins.module_utils.user import (
     convert_priv_dict_to_str,
-    get_impl,
+    get_user_implementation,
     get_mode,
     user_mod,
     privileges_grant,
@@ -930,9 +931,10 @@ class Role():
 
         if privs:
             result = user_mod(self.cursor, self.name, self.host,
-                              None, None, None, None, None, None,
-                              privs, append_privs, subtract_privs, None,
-                              self.module, role=True, maria_role=self.is_mariadb)
+                              None, None, None, None, None, None, None,
+                              privs, append_privs, subtract_privs, None, None,
+                              self.module, None, None, role=True,
+                              maria_role=self.is_mariadb)
             changed = result['changed']
 
         if admin:
@@ -1053,7 +1055,7 @@ def main():
     # Set defaults
     changed = False
 
-    get_impl(cursor)
+    impl = get_user_implementation(cursor)
 
     if priv is not None:
         try:

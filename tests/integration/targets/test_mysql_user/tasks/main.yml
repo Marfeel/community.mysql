@@ -43,6 +43,8 @@
 
     - include_tasks: test_idempotency.yml
 
+    - include_tasks: test_password_expire.yml
+
     # ============================================================
     # Create user with no privileges and verify default privileges are assign
     #
@@ -117,8 +119,8 @@
     - name: Assert grant access for user1 on multiple database
       assert:
         that:
-          - "'{{ item }}' in result.stdout"
-      with_items: "{{ db_names }}"
+          - item in result.stdout
+      loop: "{{ db_names }}"
 
     - name: Show grants access for user2 on multiple database
       command: "{{ mysql_command }} -e \"SHOW GRANTS FOR '{{ user_name_2 }}'@'localhost'\""
@@ -127,8 +129,8 @@
     - name: Assert grant access for user2 on multiple database
       assert:
         that:
-          - "'{{ item }}' in result.stdout"
-      with_items: "{{db_names}}"
+          - item in result.stdout
+      loop: "{{db_names}}"
 
     - include_tasks: utils/remove_user.yml
       vars:
@@ -267,6 +269,9 @@
       tags:
         - issue_465
 
+    # Tests for user attributes
+    - include_tasks: test_user_attributes.yml
+
     # Tests for the TLS requires dictionary
     - include_tasks: test_tls_requirements.yml
 
@@ -290,3 +295,7 @@
     - name: Mysql_user - test column case sensitive
       ansible.builtin.import_tasks:
         file: test_column_case_sensitive.yml
+
+    - name: Mysql_user - test update_password
+      ansible.builtin.import_tasks:
+        file: test_update_password.yml

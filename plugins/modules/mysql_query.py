@@ -10,9 +10,9 @@ __metaclass__ = type
 DOCUMENTATION = r'''
 ---
 module: mysql_query
-short_description: Run MySQL queries
+short_description: Run MySQL or MariaDB queries
 description:
-- Runs arbitrary MySQL queries.
+- Runs arbitrary MySQL or MariaDB queries.
 - Pay attention, the module does not support check mode!
   All queries will be executed in autocommit mode.
 - To run SQL queries from a file, use M(community.mysql.mysql_db) module.
@@ -36,6 +36,7 @@ options:
     - List of values to be passed as positional arguments to the query.
     - Mutually exclusive with I(named_args).
     type: list
+    elements: raw
   named_args:
     description:
     - Dictionary of key-value arguments to pass to the query.
@@ -55,6 +56,8 @@ attributes:
     support: none
 seealso:
 - module: community.mysql.mysql_db
+notes:
+- Compatible with MariaDB or MySQL.
 author:
 - Andrew Klychkov (@Andersson007)
 extends_documentation_fragment:
@@ -141,7 +144,7 @@ def main():
     argument_spec.update(
         query=dict(type='raw', required=True),
         login_db=dict(type='str'),
-        positional_args=dict(type='list'),
+        positional_args=dict(type='list', elements='raw'),
         named_args=dict(type='dict'),
         single_transaction=dict(type='bool', default=False),
     )

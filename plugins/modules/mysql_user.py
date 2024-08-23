@@ -11,9 +11,9 @@ __metaclass__ = type
 DOCUMENTATION = r'''
 ---
 module: mysql_user
-short_description: Adds or removes a user from a MySQL database
+short_description: Adds or removes a user from a MySQL or MariaDB database
 description:
-   - Adds or removes a user from a MySQL database.
+   - Adds or removes a user from a MySQL or MariaDB database.
 options:
   name:
     description:
@@ -139,8 +139,16 @@ options:
     description:
       - User's plugin auth_string (``CREATE USER user IDENTIFIED WITH plugin BY plugin_auth_string``).
       - If I(plugin) is ``pam`` (MariaDB) or ``auth_pam`` (MySQL) an optional I(plugin_auth_string) can be used to choose a specific PAM service.
+      - You need to define a I(salt) to have idempotence on password change with ``caching_sha2_password`` and ``sha256_password`` plugins.
     type: str
     version_added: '0.1.0'
+  salt:
+    description:
+      - Salt used to generate password hash from I(plugin_auth_string).
+      - Salt length must be 20 characters.
+      - Salt only support ``caching_sha2_password`` or ``sha256_password`` authentication I(plugin).
+    type: str
+    version_added: '3.10.0'
   resource_limits:
     description:
       - Limit the user for certain server resources. Provided since MySQL 5.6 / MariaDB 10.2.
@@ -155,6 +163,20 @@ options:
       - Cannot be used to set global variables, use the M(community.mysql.mysql_variables) module instead.
     type: dict
     version_added: '3.6.0'
+  password_expire:
+    description:
+      - C(never) - I(password) will never expire.
+      - C(default) - I(password) is defined using global system variable I(default_password_lifetime) setting.
+      - C(interval) - I(password) will expire in days which is defined in I(password_expire_interval).
+      - C(now) - I(password) will expire immediately.
+    type: str
+    choices: [ now, never, default, interval ]
+    version_added: '3.9.0'
+  password_expire_interval:
+    description:
+      - Number of days I(password) will expire. Requires I(password_expire=interval).
+    type: int
+    version_added: '3.9.0'
 
   column_case_sensitive:
     description:
@@ -165,8 +187,16 @@ options:
         fields names in privileges.
     type: bool
     version_added: '3.8.0'
+  attributes:
+    description:
+      - "Create, update, or delete user attributes (arbitrary 'key: value' comments) for the user."
+      - MySQL server must support the INFORMATION_SCHEMA.USER_ATTRIBUTES table. Provided since MySQL 8.0.
+      - To delete an existing attribute, set its value to null.
+    type: dict
+    version_added: '3.9.0'
 
 notes:
+   - Compatible with MySQL or MariaDB.
    - "MySQL server installs with default I(login_user) of C(root) and no password.
      To secure this user as part of an idempotent playbook, you must create at least two tasks:
      1) change the root user's password, without providing any I(login_user)/I(login_password) details,
@@ -257,6 +287,13 @@ EXAMPLES = r'''
       FUNCTION my_db.my_function: EXECUTE
     state: present
 
+- name: Modify user attributes, creating the attribute 'foo' and removing the attribute 'bar'
+  community.mysql.mysql_user:
+    name: bob
+    attributes:
+      foo: "foo"
+      bar: null
+
 - name: Modify user to require TLS connection with a valid client certificate
   community.mysql.mysql_user:
     name: bob
@@ -340,6 +377,13 @@ EXAMPLES = r'''
     priv: '*.*:ALL'
     state: present
 
+- name: Create user 'bob' authenticated with plugin 'caching_sha2_password' and static salt
+  community.mysql.mysql_user:
+    name: bob
+    plugin: caching_sha2_password
+    plugin_auth_string: password
+    salt: 1234567890abcdefghij
+
 - name: Limit bob's resources to 10 queries per hour and 5 connections per hour
   community.mysql.mysql_user:
     name: bob
@@ -373,7 +417,6 @@ from ansible_collections.community.mysql.plugins.module_utils.mysql import (
 )
 from ansible_collections.community.mysql.plugins.module_utils.user import (
     convert_priv_dict_to_str,
-    get_impl,
     get_mode,
     InvalidPrivsError,
     limit_resources,
@@ -405,16 +448,20 @@ def main():
         tls_requires=dict(type='dict'),
         append_privs=dict(type='bool', default=False),
         subtract_privs=dict(type='bool', default=False),
+        attributes=dict(type='dict'),
         check_implicit_admin=dict(type='bool', default=False),
         update_password=dict(type='str', default='always', choices=['always', 'on_create', 'on_new_username'], no_log=False),
         sql_log_bin=dict(type='bool', default=True),
         plugin=dict(default=None, type='str'),
         plugin_hash_string=dict(default=None, type='str'),
         plugin_auth_string=dict(default=None, type='str'),
+        salt=dict(default=None, type='str'),
         resource_limits=dict(type='dict'),
         force_context=dict(type='bool', default=False),
         session_vars=dict(type='dict'),
         column_case_sensitive=dict(type='bool', default=None),  # TODO 4.0.0 add default=True
+        password_expire=dict(type='str', choices=['now', 'never', 'default', 'interval'], no_log=True),
+        password_expire_interval=dict(type='int', required_if=[('password_expire', 'interval', True)], no_log=True),
     )
     module = AnsibleModule(
         argument_spec=argument_spec,
@@ -437,6 +484,7 @@ def main():
     append_privs = module.boolean(module.params["append_privs"])
     subtract_privs = module.boolean(module.params['subtract_privs'])
     update_password = module.params['update_password']
+    attributes = module.params['attributes']
     ssl_cert = module.params["client_cert"]
     ssl_key = module.params["client_key"]
     ssl_ca = module.params["ca_cert"]
@@ -448,9 +496,12 @@ def main():
     plugin = module.params["plugin"]
     plugin_hash_string = module.params["plugin_hash_string"]
     plugin_auth_string = module.params["plugin_auth_string"]
+    salt = module.params["salt"]
     resource_limits = module.params["resource_limits"]
     session_vars = module.params["session_vars"]
     column_case_sensitive = module.params["column_case_sensitive"]
+    password_expire = module.params["password_expire"]
+    password_expire_interval = module.params["password_expire_interval"]
 
     if priv and not isinstance(priv, (str, dict)):
         module.fail_json(msg="priv parameter must be str or dict but %s was passed" % type(priv))
@@ -460,6 +511,18 @@ def main():
 
     if mysql_driver is None:
         module.fail_json(msg=mysql_driver_fail_msg)
+
+    if password_expire_interval and password_expire_interval < 1:
+        module.fail_json(msg="password_expire_interval value \
+                             should be positive number")
+
+    if salt:
+        if not plugin_auth_string:
+            module.fail_json(msg="salt requires plugin_auth_string")
+        if len(salt) != 20:
+            module.fail_json(msg="salt must be 20 characters long")
+        if plugin not in ['caching_sha2_password', 'sha256_password']:
+            module.fail_json(msg="salt requires caching_sha2_password or sha256_password plugin")
 
     cursor = None
     try:
@@ -490,8 +553,6 @@ def main():
     if session_vars:
         set_session_vars(module, cursor, session_vars)
 
-    get_impl(cursor)
-
     if priv is not None:
         try:
             mode = get_mode(cursor)
@@ -500,21 +561,25 @@ def main():
 
         priv = privileges_unpack(priv, mode, column_case_sensitive, ensure_usage=not subtract_privs)
     password_changed = False
+    final_attributes = None
     if state == "present":
         if user_exists(cursor, user, host, host_all):
             try:
                 if update_password == "always":
                     result = user_mod(cursor, user, host, host_all, password, encrypted,
-                                      plugin, plugin_hash_string, plugin_auth_string,
-                                      priv, append_privs, subtract_privs, tls_requires, module)
+                                      plugin, plugin_hash_string, plugin_auth_string, salt,
+                                      priv, append_privs, subtract_privs, attributes, tls_requires, module,
+                                      password_expire, password_expire_interval)
 
                 else:
                     result = user_mod(cursor, user, host, host_all, None, encrypted,
-                                      None, None, None,
-                                      priv, append_privs, subtract_privs, tls_requires, module)
+                                      None, None, None, None,
+                                      priv, append_privs, subtract_privs, attributes, tls_requires, module,
+                                      password_expire, password_expire_interval)
                 changed = result['changed']
                 msg = result['msg']
                 password_changed = result['password_changed']
+                final_attributes = result['attributes']
 
             except (SQLParseError, InvalidPrivsError, mysql_driver.Error) as e:
                 module.fail_json(msg=to_native(e))
@@ -526,10 +591,12 @@ def main():
                     priv = None  # avoid granting unwanted privileges
                 reuse_existing_password = update_password == 'on_new_username'
                 result = user_add(cursor, user, host, host_all, password, encrypted,
-                                  plugin, plugin_hash_string, plugin_auth_string,
-                                  priv, tls_requires, module.check_mode, reuse_existing_password)
+                                  plugin, plugin_hash_string, plugin_auth_string, salt,
+                                  priv, attributes, tls_requires, reuse_existing_password, module,
+                                  password_expire, password_expire_interval)
                 changed = result['changed']
                 password_changed = result['password_changed']
+                final_attributes = result['attributes']
                 if changed:
                     msg = "User added"
 
@@ -546,7 +613,7 @@ def main():
         else:
             changed = False
             msg = "User doesn't exist"
-    module.exit_json(changed=changed, user=user, msg=msg, password_changed=password_changed)
+    module.exit_json(changed=changed, user=user, msg=msg, password_changed=password_changed, attributes=final_attributes)
 
 
 if __name__ == '__main__':

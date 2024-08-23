@@ -5,14 +5,15 @@
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 from __future__ import absolute_import, division, print_function
+
 __metaclass__ = type
 
 DOCUMENTATION = r'''
 ---
 module: mysql_info
-short_description: Gather information about MySQL servers
+short_description: Gather information about MySQL or MariaDB servers
 description:
-- Gathers information about MySQL servers.
+- Gathers information about MySQL or MariaDB servers.
 
 options:
   filter:
@@ -45,6 +46,7 @@ options:
     default: false
 
 notes:
+- Compatible with MariaDB or MySQL.
 - Calculating the size of a database might be slow, depending on the number and size of tables in it.
   To avoid this, use I(exclude_fields=db_size).
 
@@ -145,7 +147,7 @@ EXAMPLES = r'''
       plugin: "{{ item.plugin | default(omit) }}"
       plugin_auth_string: "{{ item.plugin_auth_string | default(omit) }}"
       plugin_hash_string: "{{ item.plugin_hash_string | default(omit) }}"
-      tls_require: "{{ item.tls_require | default(omit) }}"
+      tls_requires: "{{ item.tls_requires | default(omit) }}"
       priv: "{{ item.priv | default(omit) }}"
       resource_limits: "{{ item.resource_limits | default(omit) }}"
       column_case_sensitive: true
@@ -160,6 +162,12 @@ EXAMPLES = r'''
 '''
 
 RETURN = r'''
+server_engine:
+  description: Database server engine.
+  returned: if not excluded by filter
+  type: str
+  sample: 'MariaDB'
+  version_added: '3.10.0'
 version:
   description: Database server version.
   returned: if not excluded by filter
@@ -239,7 +247,8 @@ users_info:
       "host": "host.com",
       "plugin": "mysql_native_password",
       "priv": "db1.*:SELECT/db2.*:SELECT",
-      "resource_limits": { "MAX_USER_CONNECTIONS": 100 } }
+      "resource_limits": { "MAX_USER_CONNECTIONS": 100 },
+      "tls_requires": { "SSL": null } }
   version_added: '3.8.0'
 engines:
   description: Information about the server's storage engines.
@@ -271,7 +280,6 @@ connector_name:
   type: str
   sample:
   - "pymysql"
-  - "MySQLdb"
   version_added: '3.6.0'
 connector_version:
   description: Version of the python connector used by the module. When the connector is not identified, returns C(Unknown).
@@ -285,6 +293,9 @@ connector_version:
 from decimal import Decimal
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible_collections.community.mysql.plugins.module_utils.command_resolver import (
+    CommandResolver
+)
 from ansible_collections.community.mysql.plugins.module_utils.mysql import (
     mysql_connect,
     mysql_common_argument_spec,
@@ -292,12 +303,15 @@ from ansible_collections.community.mysql.plugins.module_utils.mysql import (
     mysql_driver_fail_msg,
     get_connector_name,
     get_connector_version,
+    get_server_implementation,
+    get_server_version,
 )
 
 from ansible_collections.community.mysql.plugins.module_utils.user import (
     privileges_get,
     get_resource_limits,
     get_existing_authentication,
+    get_user_implementation,
 )
 from ansible.module_utils.six import iteritems
 from ansible.module_utils._text import to_native
@@ -325,9 +339,13 @@ class MySQL_Info(object):
         5. add info about the new subset with an example to RETURN block
     """
 
-    def __init__(self, module, cursor):
+    def __init__(self, module, cursor, server_implementation, server_version, user_implementation):
         self.module = module
         self.cursor = cursor
+        self.server_implementation = server_implementation
+        self.server_version = server_version
+        self.user_implementation = user_implementation
+        self.command_resolver = CommandResolver(self.server_implementation, self.server_version)
         self.info = {
             'version': {},
             'databases': {},
@@ -489,7 +507,8 @@ class MySQL_Info(object):
 
     def __get_master_status(self):
         """Get master status if the instance is a master."""
-        res = self.__exec_sql('SHOW MASTER STATUS')
+        query = self.command_resolver.resolve_command("SHOW MASTER STATUS")
+        res = self.__exec_sql(query)
         if res:
             for line in res:
                 for vname, val in iteritems(line):
@@ -497,7 +516,8 @@ class MySQL_Info(object):
 
     def __get_slave_status(self):
         """Get slave status if the instance is a slave."""
-        res = self.__exec_sql('SHOW SLAVE STATUS')
+        query = self.command_resolver.resolve_command("SHOW SLAVE STATUS")
+        res = self.__exec_sql(query)
         if res:
             for line in res:
                 host = line['Master_Host']
@@ -518,7 +538,8 @@ class MySQL_Info(object):
 
     def __get_slaves(self):
         """Get slave hosts info if the instance is a master."""
-        res = self.__exec_sql('SHOW SLAVE HOSTS')
+        query = self.command_resolver.resolve_command("SHOW SLAVE HOSTS")
+        res = self.__exec_sql(query)
         if res:
             for line in res:
                 srv_id = line['Server_id']
@@ -596,13 +617,17 @@ class MySQL_Info(object):
                 priv_string.remove('*.*:USAGE')
 
             resource_limits = get_resource_limits(self.cursor, user, host)
-
             copy_ressource_limits = dict.copy(resource_limits)
+
+            tls_requires = self.user_implementation.get_tls_requires(
+                self.cursor, user, host)
+
             output_dict = {
                 'name': user,
                 'host': host,
                 'priv': '/'.join(priv_string),
                 'resource_limits': copy_ressource_limits,
+                'tls_requires': tls_requires,
             }
 
             # Prevent returning a resource limit if empty
@@ -613,9 +638,13 @@ class MySQL_Info(object):
                 if len(output_dict['resource_limits']) == 0:
                     del output_dict['resource_limits']
 
+            # Prevent returning tls_require if empty
+            if not tls_requires:
+                del output_dict['tls_requires']
+
             authentications = get_existing_authentication(self.cursor, user, host)
             if authentications:
-                output_dict.update(authentications)
+                output_dict.update(authentications[0])
 
             # TODO password_option
             # TODO lock_option
@@ -692,8 +721,8 @@ def main():
     argument_spec = mysql_common_argument_spec()
     argument_spec.update(
         login_db=dict(type='str'),
-        filter=dict(type='list'),
-        exclude_fields=dict(type='list'),
+        filter=dict(type='list', elements='str'),
+        exclude_fields=dict(type='list', elements='str'),
         return_empty_dbs=dict(type='bool', default=False),
     )
 
@@ -738,12 +767,17 @@ def main():
                'Exception message: %s' % (connector_name, connector_version, config_file, to_native(e)))
         module.fail_json(msg)
 
+    server_implementation = get_server_implementation(cursor)
+    server_version = get_server_version(cursor)
+    user_implementation = get_user_implementation(cursor)
+
     ###############################
     # Create object and do main job
 
-    mysql = MySQL_Info(module, cursor)
+    mysql = MySQL_Info(module, cursor, server_implementation, server_version, user_implementation)
 
     module.exit_json(changed=False,
+                     server_engine='MariaDB' if server_implementation == 'mariadb' else 'MySQL',
                      connector_name=connector_name,
                      connector_version=connector_version,
                      **mysql.get_info(filter_, exclude_fields, return_empty_dbs))

@@ -1,4 +1,6 @@
 from __future__ import (absolute_import, division, print_function)
+
+
 __metaclass__ = type
 
 # This code is part of Ansible, but is an independent component.
@@ -10,12 +12,18 @@ __metaclass__ = type
 # Simplified BSD License (see simplified_bsd.txt or https://opensource.org/licenses/BSD-2-Clause)
 
 import string
+import json
 import re
 
 from ansible.module_utils.six import iteritems
 
 from ansible_collections.community.mysql.plugins.module_utils.mysql import (
     mysql_driver,
+    get_server_implementation,
+)
+from ansible_collections.community.mysql.plugins.module_utils.implementations.mysql.hash import (
+    mysql_sha256_password_hash,
+    mysql_sha256_password_hash_hex,
 )
 
 
@@ -79,31 +87,6 @@ def do_not_mogrify_requires(query, params, tls_requires):
     return query, params
 
 
-def get_tls_requires(cursor, user, host):
-    if user:
-        if not impl.use_old_user_mgmt(cursor):
-            query = "SHOW CREATE USER '%s'@'%s'" % (user, host)
-        else:
-            query = "SHOW GRANTS for '%s'@'%s'" % (user, host)
-
-        cursor.execute(query)
-        require_list = [tuple[0] for tuple in filter(lambda x: "REQUIRE" in x[0], cursor.fetchall())]
-        require_line = require_list[0] if require_list else ""
-        pattern = r"(?<=\bREQUIRE\b)(.*?)(?=(?:\bPASSWORD\b|$))"
-        requires_match = re.search(pattern, require_line)
-        requires = requires_match.group().strip() if requires_match else ""
-        if any((requires.startswith(req) for req in ('SSL', 'X509', 'NONE'))):
-            requires = requires.split()[0]
-            if requires == 'NONE':
-                requires = None
-        else:
-            import shlex
-
-            items = iter(shlex.split(requires))
-            requires = dict(zip(items, items))
-        return requires or None
-
-
 def get_grants(cursor, user, host):
     cursor.execute("SHOW GRANTS FOR %s@%s", (user, host))
     grants_line = list(filter(lambda x: "ON *.*" in x[0], cursor.fetchall()))[0]
@@ -112,8 +95,12 @@ def get_grants(cursor, user, host):
     return grants.split(", ")
 
 
-def get_existing_authentication(cursor, user, host):
-    # Return the plugin and auth_string if there is exactly one distinct existing plugin and auth_string.
+def get_existing_authentication(cursor, user, host=None):
+    """ Return a list of dict containing the plugin and auth_string for the
+    specified username.
+    If hostname is provided, return only the information about this particular
+    account.
+    """
     cursor.execute("SELECT VERSION()")
     srv_type = cursor.fetchone()
     # Mysql_info use a DictCursor so we must convert back to a list
@@ -124,54 +111,91 @@ def get_existing_authentication(cursor, user, host):
     if 'mariadb' in srv_type[0].lower():
         # before MariaDB 10.2.19 and 10.3.11, "password" and "authentication_string" can differ
         # when using mysql_native_password
-        cursor.execute("""select plugin, auth from (
-            select plugin, password as auth from mysql.user where user=%(user)s
-            and host=%(host)s
-            union select plugin, authentication_string as auth from mysql.user where user=%(user)s
-            and host=%(host)s) x group by plugin, auth limit 2
-        """, {'user': user, 'host': host})
+        if host:
+            cursor.execute("""select plugin, auth from (
+                select plugin, password as auth from mysql.user where user=%(user)s
+                and host=%(host)s
+                union select plugin, authentication_string as auth from mysql.user where user=%(user)s
+                and host=%(host)s) x group by plugin, auth
+            """, {'user': user, 'host': host})
+        else:
+            cursor.execute("""select plugin, auth from (
+                select plugin, password as auth from mysql.user where user=%(user)s
+                union select plugin, authentication_string as auth from mysql.user where user=%(user)s
+                ) x group by plugin, auth
+            """, {'user': user})
     else:
-        cursor.execute("""select plugin, authentication_string as auth
-            from mysql.user where user=%(user)s and host=%(host)s
-            group by plugin, authentication_string limit 2""", {'user': user, 'host': host})
+        if host:
+            cursor.execute("""select plugin, authentication_string as auth
+                from mysql.user where user=%(user)s and host=%(host)s
+                group by plugin, authentication_string""", {'user': user, 'host': host})
+        else:
+            cursor.execute("""select plugin, authentication_string as auth
+                from mysql.user where user=%(user)s
+                group by plugin, authentication_string""", {'user': user})
+
     rows = cursor.fetchall()
 
-    # Mysql_info use a DictCursor so we must convert back to a list
-    # otherwise we get KeyError 0
-    if isinstance(rows, dict):
-        rows = list(rows.values())
+    if len(rows) == 0:
+        return []
 
-    if isinstance(rows[0], tuple):
-        return {'plugin': rows[0][0], 'plugin_auth_string': rows[0][1]}
-
+    # Mysql_info use a DictCursor so we must convert list(dict)
+    # to list(tuple) otherwise we get KeyError 0
     if isinstance(rows[0], dict):
-        return {'plugin': rows[0].get('plugin'), 'plugin_auth_string': rows[0].get('auth')}
-    return None
+        rows = [tuple(row.values()) for row in rows]
+
+    existing_auth_list = []
+
+    # 'plugin_auth_string' contains the hash string. Must be removed in c.mysql 4.0
+    # See https://github.com/ansible-collections/community.mysql/pull/629
+    for r in rows:
+        existing_auth_list.append({
+            'plugin': r[0],
+            'plugin_auth_string': r[1],
+            'plugin_hash_string': r[1]})
+
+    return existing_auth_list
 
 
 def user_add(cursor, user, host, host_all, password, encrypted,
-             plugin, plugin_hash_string, plugin_auth_string, new_priv,
-             tls_requires, check_mode, reuse_existing_password):
+             plugin, plugin_hash_string, plugin_auth_string, salt, new_priv,
+             attributes, tls_requires, reuse_existing_password, module,
+             password_expire, password_expire_interval):
+    # If attributes are set, perform a sanity check to ensure server supports user attributes before creating user
+    if attributes and not get_attribute_support(cursor):
+        module.fail_json(msg="user attributes were specified but the server does not support user attributes")
+
     # we cannot create users without a proper hostname
     if host_all:
-        return {'changed': False, 'password_changed': False}
+        return {'changed': False, 'password_changed': False, 'attributes': attributes}
 
-    if check_mode:
-        return {'changed': True, 'password_changed': None}
+    if module.check_mode:
+        return {'changed': True, 'password_changed': None, 'attributes': attributes}
 
     # Determine what user management method server uses
+    impl = get_user_implementation(cursor)
     old_user_mgmt = impl.use_old_user_mgmt(cursor)
 
     mogrify = do_not_mogrify_requires if old_user_mgmt else mogrify_requires
 
+    # This is for update_password: on_new_username
     used_existing_password = False
     if reuse_existing_password:
-        existing_auth = get_existing_authentication(cursor, user, host)
+        existing_auth = get_existing_authentication(cursor, user)
         if existing_auth:
-            plugin = existing_auth['plugin']
-            plugin_hash_string = existing_auth['auth_string']
-            password = None
-            used_existing_password = True
+            if len(existing_auth) != 1:
+                module.warn("An account with the username %s has a different "
+                            "password than the others existing accounts. Thus "
+                            "on_new_username can't decide which password to "
+                            "reuse so it will use your provided password "
+                            "instead. If no password is provided, the account "
+                            "will have an empty password!" % user)
+                used_existing_password = False
+            else:
+                plugin_hash_string = existing_auth[0]['plugin_hash_string']
+                password = None
+                used_existing_password = True
+                plugin = existing_auth[0]['plugin']  # What if plugin differ?
     if password and encrypted:
         if impl.supports_identified_by_password(cursor):
             query_with_args = "CREATE USER %s@%s IDENTIFIED BY PASSWORD %s", (user, host, password)
@@ -190,6 +214,12 @@ def user_add(cursor, user, host, host_all, password, encrypted,
         # Mysql and MariaDB differ in naming pam plugin and Syntax to set it
         if plugin == 'pam':  # Used by MariaDB which requires the USING keyword, not BY
             query_with_args = "CREATE USER %s@%s IDENTIFIED WITH %s USING %s", (user, host, plugin, plugin_auth_string)
+        elif salt:
+            if plugin in ['caching_sha2_password', 'sha256_password']:
+                generated_hash_string = mysql_sha256_password_hash_hex(password=plugin_auth_string, salt=salt)
+            else:
+                module.fail_json(msg="salt not handled for %s authentication plugin" % plugin)
+            query_with_args = ("CREATE USER %s@%s IDENTIFIED WITH %s AS 0x" + generated_hash_string), (user, host, plugin)
         else:
             query_with_args = "CREATE USER %s@%s IDENTIFIED WITH %s BY %s", (user, host, plugin, plugin_auth_string)
     elif plugin:
@@ -200,12 +230,25 @@ def user_add(cursor, user, host, host_all, password, encrypted,
     query_with_args_and_tls_requires = query_with_args + (tls_requires,)
     cursor.execute(*mogrify(*query_with_args_and_tls_requires))
 
+    if password_expire:
+        if not impl.server_supports_password_expire(cursor):
+            module.fail_json(msg="The server version does not match the requirements "
+                             "for password_expire parameter. See module's documentation.")
+        set_password_expire(cursor, user, host, password_expire, password_expire_interval)
+
     if new_priv is not None:
         for db_table, priv in iteritems(new_priv):
             privileges_grant(cursor, user, host, db_table, priv, tls_requires)
     if tls_requires is not None:
         privileges_grant(cursor, user, host, "*.*", get_grants(cursor, user, host), tls_requires)
-    return {'changed': True, 'password_changed': not used_existing_password}
+
+    final_attributes = None
+
+    if attributes:
+        cursor.execute("ALTER USER %s@%s ATTRIBUTE %s", (user, host, json.dumps(attributes)))
+        final_attributes = attributes_get(cursor, user, host)
+
+    return {'changed': True, 'password_changed': not used_existing_password, 'attributes': final_attributes}
 
 
 def is_hash(password):
@@ -217,13 +260,15 @@ def is_hash(password):
 
 
 def user_mod(cursor, user, host, host_all, password, encrypted,
-             plugin, plugin_hash_string, plugin_auth_string, new_priv,
-             append_privs, subtract_privs, tls_requires, module, role=False, maria_role=False):
+             plugin, plugin_hash_string, plugin_auth_string, salt, new_priv,
+             append_privs, subtract_privs, attributes, tls_requires, module,
+             password_expire, password_expire_interval, role=False, maria_role=False):
     changed = False
     msg = "User unchanged"
     grant_option = False
 
     # Determine what user management method server uses
+    impl = get_user_implementation(cursor)
     old_user_mgmt = impl.use_old_user_mgmt(cursor)
 
     if host_all and not role:
@@ -278,27 +323,48 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
                 if current_pass_hash != encrypted_password:
                     password_changed = True
                     msg = "Password updated"
-                    if module.check_mode:
-                        return {'changed': True, 'msg': msg, 'password_changed': password_changed}
-                    if old_user_mgmt:
-                        cursor.execute("SET PASSWORD FOR %s@%s = %s", (user, host, encrypted_password))
-                        msg = "Password updated (old style)"
-                    else:
-                        try:
-                            cursor.execute("ALTER USER %s@%s IDENTIFIED WITH mysql_native_password AS %s", (user, host, encrypted_password))
-                            msg = "Password updated (new style)"
-                        except (mysql_driver.Error) as e:
-                            # https://stackoverflow.com/questions/51600000/authentication-string-of-root-user-on-mysql
-                            # Replacing empty root password with new authentication mechanisms fails with error 1396
-                            if e.args[0] == 1396:
-                                cursor.execute(
-                                    "UPDATE mysql.user SET plugin = %s, authentication_string = %s, Password = '' WHERE User = %s AND Host = %s",
-                                    ('mysql_native_password', encrypted_password, user, host)
-                                )
-                                cursor.execute("FLUSH PRIVILEGES")
-                                msg = "Password forced update"
-                            else:
-                                raise e
+                    if not module.check_mode:
+                        if old_user_mgmt:
+                            cursor.execute("SET PASSWORD FOR %s@%s = %s", (user, host, encrypted_password))
+                            msg = "Password updated (old style)"
+                        else:
+                            try:
+                                cursor.execute("ALTER USER %s@%s IDENTIFIED WITH mysql_native_password AS %s", (user, host, encrypted_password))
+                                msg = "Password updated (new style)"
+                            except (mysql_driver.Error) as e:
+                                # https://stackoverflow.com/questions/51600000/authentication-string-of-root-user-on-mysql
+                                # Replacing empty root password with new authentication mechanisms fails with error 1396
+                                if e.args[0] == 1396:
+                                    cursor.execute(
+                                        "UPDATE mysql.user SET plugin = %s, authentication_string = %s, Password = '' WHERE User = %s AND Host = %s",
+                                        ('mysql_native_password', encrypted_password, user, host)
+                                    )
+                                    cursor.execute("FLUSH PRIVILEGES")
+                                    msg = "Password forced update"
+                                else:
+                                    raise e
+                    changed = True
+
+        # Handle password expiration
+        if bool(password_expire):
+            if not impl.server_supports_password_expire(cursor):
+                module.fail_json(msg="The server version does not match the requirements "
+                                     "for password_expire parameter. See module's documentation.")
+            update = False
+            mariadb_role = True if "mariadb" in str(impl.__name__) else False
+            current_password_policy = get_password_expiration_policy(cursor, user, host, maria_role=mariadb_role)
+            password_expired = is_password_expired(cursor, user, host)
+            # Check if changes needed to be applied.
+            if not ((current_password_policy == -1 and password_expire == "default") or
+                    (current_password_policy == 0 and password_expire == "never") or
+                    (current_password_policy == password_expire_interval and password_expire == "interval") or
+                    (password_expire == 'now' and password_expired)):
+
+                update = True
+
+                if not module.check_mode:
+                    set_password_expire(cursor, user, host, password_expire, password_expire_interval)
+                    password_changed = True
                     changed = True
 
         # Handle plugin authentication
@@ -315,7 +381,11 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
             if plugin_hash_string and current_plugin[1] != plugin_hash_string:
                 update = True
 
-            if plugin_auth_string and current_plugin[1] != plugin_auth_string:
+            if salt:
+                if plugin in ['caching_sha2_password', 'sha256_password']:
+                    if current_plugin[1] != mysql_sha256_password_hash(password=plugin_auth_string, salt=salt):
+                        update = True
+            elif plugin_auth_string and current_plugin[1] != plugin_auth_string:
                 # this case can cause more updates than expected,
                 # as plugin can hash auth_string in any way it wants
                 # and there's no way to figure it out for
@@ -331,8 +401,14 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
                     query_with_args = "ALTER USER %s@%s IDENTIFIED WITH %s AS %s", (user, host, plugin, plugin_hash_string)
                 elif plugin_auth_string:
                     # Mysql and MariaDB differ in naming pam plugin and syntax to set it
-                    if plugin == 'pam':
+                    if plugin in ('pam', 'ed25519'):
                         query_with_args = "ALTER USER %s@%s IDENTIFIED WITH %s USING %s", (user, host, plugin, plugin_auth_string)
+                    elif salt:
+                        if plugin in ['caching_sha2_password', 'sha256_password']:
+                            generated_hash_string = mysql_sha256_password_hash_hex(password=plugin_auth_string, salt=salt)
+                        else:
+                            module.fail_json(msg="salt not handled for %s authentication plugin" % plugin)
+                        query_with_args = ("ALTER USER %s@%s IDENTIFIED WITH %s AS 0x" + generated_hash_string), (user, host, plugin)
                     else:
                         query_with_args = "ALTER USER %s@%s IDENTIFIED WITH %s BY %s", (user, host, plugin, plugin_auth_string)
                 else:
@@ -355,9 +431,8 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
                     if db_table not in new_priv:
                         if user != "root" and "PROXY" not in priv:
                             msg = "Privileges updated"
-                            if module.check_mode:
-                                return {'changed': True, 'msg': msg, 'password_changed': password_changed}
-                            privileges_revoke(cursor, user, host, db_table, priv, grant_option, maria_role)
+                            if not module.check_mode:
+                                privileges_revoke(cursor, user, host, db_table, priv, grant_option, maria_role)
                             changed = True
 
             # If the user doesn't currently have any privileges on a db.table, then
@@ -366,9 +441,8 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
                 for db_table, priv in iteritems(new_priv):
                     if db_table not in curr_priv:
                         msg = "New privileges granted"
-                        if module.check_mode:
-                            return {'changed': True, 'msg': msg, 'password_changed': password_changed}
-                        privileges_grant(cursor, user, host, db_table, priv, tls_requires, maria_role)
+                        if not module.check_mode:
+                            privileges_grant(cursor, user, host, db_table, priv, tls_requires, maria_role)
                         changed = True
 
             # If the db.table specification exists in both the user's current privileges
@@ -407,42 +481,82 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
 
                 if len(grant_privs) + len(revoke_privs) > 0:
                     msg = "Privileges updated: granted %s, revoked %s" % (grant_privs, revoke_privs)
-                    if module.check_mode:
-                        return {'changed': True, 'msg': msg, 'password_changed': password_changed}
-                    if len(revoke_privs) > 0:
-                        privileges_revoke(cursor, user, host, db_table, revoke_privs, grant_option, maria_role)
-                    if len(grant_privs) > 0:
-                        privileges_grant(cursor, user, host, db_table, grant_privs, tls_requires, maria_role)
+                    if not module.check_mode:
+                        if len(revoke_privs) > 0:
+                            privileges_revoke(cursor, user, host, db_table, revoke_privs, grant_option, maria_role)
+                        if len(grant_privs) > 0:
+                            privileges_grant(cursor, user, host, db_table, grant_privs, tls_requires, maria_role)
+                    else:
+                        changed = True
 
             # after privilege manipulation, compare privileges from before and now
             after_priv = privileges_get(cursor, user, host, maria_role)
             changed = changed or (curr_priv != after_priv)
 
+        # Handle attributes
+        attribute_support = get_attribute_support(cursor)
+        final_attributes = {}
+
+        if attributes:
+            if not attribute_support:
+                module.fail_json(msg="user attributes were specified but the server does not support user attributes")
+            else:
+                current_attributes = attributes_get(cursor, user, host)
+
+                if current_attributes is None:
+                    current_attributes = {}
+
+                attributes_to_change = {}
+
+                for key, value in attributes.items():
+                    if key not in current_attributes or current_attributes[key] != value:
+                        attributes_to_change[key] = value
+
+                if attributes_to_change:
+                    msg = "Attributes updated: %s" % (", ".join(["%s: %s" % (key, value) for key, value in attributes_to_change.items()]))
+
+                    # Calculate final attributes by re-running attributes_get when not in check mode, and merge dictionaries when in check mode
+                    if not module.check_mode:
+                        cursor.execute("ALTER USER %s@%s ATTRIBUTE %s", (user, host, json.dumps(attributes_to_change)))
+                        final_attributes = attributes_get(cursor, user, host)
+                    else:
+                        # Final if statements excludes items whose values are None in attributes_to_change, i.e. attributes that will be deleted
+                        final_attributes = {k: v for d in (current_attributes, attributes_to_change) for k, v in d.items() if k not in attributes_to_change or
+                                            attributes_to_change[k] is not None}
+
+                        # Convert empty dict to None per return value requirements
+                        final_attributes = final_attributes if final_attributes else None
+                    changed = True
+                else:
+                    final_attributes = current_attributes
+        else:
+            if attribute_support:
+                final_attributes = attributes_get(cursor, user, host)
+
         if role:
             continue
 
         # Handle TLS requirements
-        current_requires = get_tls_requires(cursor, user, host)
+        current_requires = sanitize_requires(impl.get_tls_requires(cursor, user, host))
         if current_requires != tls_requires:
             msg = "TLS requires updated"
-            if module.check_mode:
-                return {'changed': True, 'msg': msg, 'password_changed': password_changed}
-            if not old_user_mgmt:
-                pre_query = "ALTER USER"
-            else:
-                pre_query = "GRANT %s ON *.* TO" % ",".join(get_grants(cursor, user, host))
+            if not module.check_mode:
+                if not old_user_mgmt:
+                    pre_query = "ALTER USER"
+                else:
+                    pre_query = "GRANT %s ON *.* TO" % ",".join(get_grants(cursor, user, host))
 
-            if tls_requires is not None:
-                query = " ".join((pre_query, "%s@%s"))
-                query_with_args = mogrify_requires(query, (user, host), tls_requires)
-            else:
-                query = " ".join((pre_query, "%s@%s REQUIRE NONE"))
-                query_with_args = query, (user, host)
+                if tls_requires is not None:
+                    query = " ".join((pre_query, "%s@%s"))
+                    query_with_args = mogrify_requires(query, (user, host), tls_requires)
+                else:
+                    query = " ".join((pre_query, "%s@%s REQUIRE NONE"))
+                    query_with_args = query, (user, host)
 
-            cursor.execute(*query_with_args)
+                cursor.execute(*query_with_args)
             changed = True
 
-    return {'changed': changed, 'msg': msg, 'password_changed': password_changed}
+    return {'changed': changed, 'msg': msg, 'password_changed': password_changed, 'attributes': final_attributes}
 
 
 def user_delete(cursor, user, host, host_all, check_mode):
@@ -761,6 +875,7 @@ def privileges_grant(cursor, user, host, db_table, priv, tls_requires, maria_rol
         query.append("TO %s")
         params = (user)
 
+    impl = get_user_implementation(cursor)
     if tls_requires and impl.use_old_user_mgmt(cursor):
         query, params = mogrify_requires(" ".join(query), params, tls_requires)
         query = [query]
@@ -897,6 +1012,7 @@ def limit_resources(module, cursor, user, host, resource_limits, check_mode):
 
     Returns: True, if changed, False otherwise.
     """
+    impl = get_user_implementation(cursor)
     if not impl.server_supports_alter_user(cursor):
         module.fail_json(msg="The server version does not match the requirements "
                              "for resource_limits parameter. See module's documentation.")
@@ -927,12 +1043,116 @@ def limit_resources(module, cursor, user, host, resource_limits, check_mode):
     return True
 
 
-def get_impl(cursor):
-    global impl
-    cursor.execute("SELECT VERSION()")
-    if 'mariadb' in cursor.fetchone()[0].lower():
+def set_password_expire(cursor, user, host, password_expire, password_expire_interval):
+    """Fuction to set passowrd expiration for user.
+
+    Args:
+        cursor (cursor): DB driver cursor object.
+        user (str): User name.
+        host (str): User hostname.
+        password_expire (str): Password expiration mode.
+        password_expire_days (int): Invterval of days password expires.
+    """
+    if password_expire.lower() == "never":
+        statement = "PASSWORD EXPIRE NEVER"
+    elif password_expire.lower() == "default":
+        statement = "PASSWORD EXPIRE DEFAULT"
+    elif password_expire.lower() == "interval":
+        statement = "PASSWORD EXPIRE INTERVAL %d DAY" % (password_expire_interval)
+    elif password_expire.lower() == "now":
+        statement = "PASSWORD EXPIRE"
+
+    cursor.execute("ALTER USER %s@%s " + statement, (user, host))
+
+
+def get_password_expiration_policy(cursor, user, host, maria_role=False):
+    """Function to get password policy for user.
+
+    Args:
+        cursor (cursor): DB driver cursor object.
+        user (str): User name.
+        host (str): User hostname.
+        maria_role (bool, optional): mariadb or mysql. Defaults to False.
+
+    Returns:
+        policy (int): Current users password policy.
+    """
+    if not maria_role:
+        statement = "SELECT IFNULL(password_lifetime, -1) FROM mysql.user \
+            WHERE User = %s AND Host = %s", (user, host)
+    else:
+        statement = "SELECT JSON_EXTRACT(Priv, '$.password_lifetime') AS password_lifetime \
+            FROM mysql.global_priv \
+            WHERE User = %s AND Host = %s", (user, host)
+    cursor.execute(*statement)
+    policy = cursor.fetchone()[0]
+    return int(policy)
+
+
+def is_password_expired(cursor, user, host):
+    """Function to check if password is expired
+
+    Args:
+        cursor (cursor): DB driver cursor object.
+        user (str): User name.
+        host (str): User hostname.
+
+    Returns:
+        expired (bool): True if expired, else False.
+    """
+    statement = "SELECT password_expired FROM mysql.user \
+            WHERE User = %s AND Host = %s", (user, host)
+    cursor.execute(*statement)
+    expired = cursor.fetchone()[0]
+    if str(expired) == "Y":
+        return True
+    return False
+
+
+def get_attribute_support(cursor):
+    """Checks if the MySQL server supports user attributes.
+
+    Args:
+        cursor (cursor): DB driver cursor object.
+    Returns:
+        True if attributes are supported, False if they are not.
+    """
+    try:
+        # information_schema.tables does not hold the tables within information_schema itself
+        cursor.execute("SELECT attribute FROM INFORMATION_SCHEMA.USER_ATTRIBUTES LIMIT 0")
+        cursor.fetchone()
+    except mysql_driver.Error:
+        return False
+
+    return True
+
+
+def attributes_get(cursor, user, host):
+    """Get attributes for a given user.
+
+    Args:
+        cursor (cursor): DB driver cursor object.
+        user (str): User name.
+        host (str): User host name.
+
+    Returns:
+        None if the user does not exist or the user has no attributes set, otherwise a dict of attributes set on the user
+    """
+    cursor.execute("SELECT attribute FROM INFORMATION_SCHEMA.USER_ATTRIBUTES WHERE user = %s AND host = %s", (user, host))
+
+    r = cursor.fetchone()
+    # convert JSON string stored in row into a dict - mysql enforces that user_attributes entires are in JSON format
+    j = json.loads(r[0]) if r and r[0] else None
+
+    # if the attributes dict is empty, return None instead
+    return j if j else None
+
+
+def get_user_implementation(cursor):
+    db_engine = get_server_implementation(cursor)
+    if db_engine == 'mariadb':
         from ansible_collections.community.mysql.plugins.module_utils.implementations.mariadb import user as mariauser
-        impl = mariauser
+        return mariauser
     else:
         from ansible_collections.community.mysql.plugins.module_utils.implementations.mysql import user as mysqluser
-        impl = mysqluser
+        return mysqluser
