@@ -393,8 +393,9 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
                 update = True
 
             if update:
+                password_changed = True
                 if module.check_mode:
-                    return {'changed': True, 'msg': 'Auth plugin updated', 'password_changed': True}
+                    return {'changed': True, 'msg': 'Auth plugin updated', 'password_changed': password_changed}
                 if plugin_hash_string:
                     query_with_args = "ALTER USER %s@%s IDENTIFIED WITH %s AS %s", (user, host, plugin, plugin_hash_string)
                 elif plugin_auth_string:
